@@ -80,12 +80,13 @@ export function useAntiTampering(onViolation: ViolationCallback) {
     });
 
     // 4. Protect window object properties (hanya block set, bukan get)
+    // CATATAN: fetch & XMLHttpRequest TIDAK dimasukkan di sini karena
+    // kita sudah override fetch secara manual di bawah, dan React/Vite
+    // internals kadang re-assign property ini saat startup → false positive
     const protectedProps = [
       'localStorage',
       'sessionStorage',
       'indexedDB',
-      'fetch',
-      'XMLHttpRequest',
       'WebSocket',
     ];
 
