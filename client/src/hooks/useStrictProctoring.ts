@@ -1,29 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 
-/**
- * useStrictProctoring - Hook untuk monitoring super ketat ujian
- * 
- * Fitur:
- * - Allow keyboard input untuk typing essay
- * - Block shortcut berbahaya (Ctrl+C, Ctrl+V, Windows key, Alt+Tab, F12, dll)
- * - Disable mouse kanan
- * - Deteksi idle time
- * - Deteksi multiple displays
- * - Deteksi aplikasi background
- * - Deteksi print screen
- * - Deteksi perubahan brightness/volume
- * - Deteksi USB/device baru
- * - Lock screen otomatis
- */
-
 interface ViolationCallback {
   (type: string, description: string): void;
 }
 
+const STARTUP_GRACE_MS = 4000; // 4 detik grace period setelah ExamPage mount
+
 export function useStrictProctoring(onViolation: ViolationCallback) {
   const lastActivityRef = useRef<number>(Date.now());
   const violationCountRef = useRef<number>(0);
+  const startTimeRef = useRef<number>(Date.now());
   const [isLocked, setIsLocked] = useState(false);
+
+  const isReady = () => Date.now() - startTimeRef.current > STARTUP_GRACE_MS;
 
   // 1. Block shortcut berbahaya (tapi allow keyboard input normal)
   useEffect(() => {
@@ -94,26 +83,22 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
         return false;
       }
 
-      // Block Ctrl+Shift+I (Developer Tools)
-      if (ctrlKey && e.shiftKey && e.key === 'i') {
+      // Block Ctrl+Shift+I/J/C (Developer Tools)
+      if (ctrlKey && e.shiftKey && (e.key === 'i' || e.key === 'I')) {
         e.preventDefault();
         e.stopPropagation();
         violationCountRef.current++;
         onViolation('DEV_TOOLS', `Ctrl+Shift+I terdeteksi (${violationCountRef.current}x)`);
         return false;
       }
-
-      // Block Ctrl+Shift+J (Developer Tools)
-      if (ctrlKey && e.shiftKey && e.key === 'j') {
+      if (ctrlKey && e.shiftKey && (e.key === 'j' || e.key === 'J')) {
         e.preventDefault();
         e.stopPropagation();
         violationCountRef.current++;
         onViolation('DEV_TOOLS', `Ctrl+Shift+J terdeteksi (${violationCountRef.current}x)`);
         return false;
       }
-
-      // Block Ctrl+Shift+C (Inspect Element)
-      if (ctrlKey && e.shiftKey && e.key === 'c') {
+      if (ctrlKey && e.shiftKey && (e.key === 'c' || e.key === 'C')) {
         e.preventDefault();
         e.stopPropagation();
         violationCountRef.current++;
@@ -175,7 +160,7 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
         return false;
       }
 
-      // Block Escape key (untuk prevent exit dari fullscreen)
+      // Block Escape key
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -189,22 +174,18 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
     };
 
     window.addEventListener('keydown', handleKeyDown, true);
-
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown, true);
-    };
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [onViolation]);
 
   // 2. Disable mouse kanan
   useEffect(() => {
     const handleMouseDown = (e: MouseEvent) => {
-      if (e.button === 2) { // Right click
+      if (e.button === 2) {
         e.preventDefault();
         e.stopPropagation();
         onViolation('RIGHT_CLICK', 'Right-click terdeteksi');
         return false;
       }
-      // Update last activity untuk mouse click
       lastActivityRef.current = Date.now();
     };
 
@@ -215,8 +196,7 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
       return false;
     };
 
-    const handleMouseMove = (e: MouseEvent) => {
-      // Update last activity
+    const handleMouseMove = () => {
       lastActivityRef.current = Date.now();
     };
 
@@ -231,64 +211,55 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
     };
   }, [onViolation]);
 
-  // 3. Deteksi idle time (30 detik tanpa aktivitas)
+  // 3. Deteksi idle time — grace period 4 detik + idle threshold 30 detik
+  // Jadi user punya total 34 detik sebelum pertama kali bisa trigger
   useEffect(() => {
-    const checkIdle = () => {
-      const now = Date.now();
-      const idleTime = (now - lastActivityRef.current) / 1000; // dalam detik
+    // Reset timer aktivitas saat hook mount supaya baseline fresh
+    lastActivityRef.current = Date.now();
 
+    const checkIdle = () => {
+      if (!isReady()) return; // Jangan check idle selama grace period
+      const idleTime = (Date.now() - lastActivityRef.current) / 1000;
       if (idleTime > 30) {
         onViolation('IDLE_TIMEOUT', `User idle selama ${Math.floor(idleTime)} detik`);
       }
     };
 
-    const idleInterval = setInterval(checkIdle, 5000); // Check setiap 5 detik
-
+    const idleInterval = setInterval(checkIdle, 5000);
     return () => clearInterval(idleInterval);
   }, [onViolation]);
 
-  // 4. Deteksi multiple displays
+  // 4. Deteksi multiple displays — hanya via enumerateDevices, hapus resolusi check
   useEffect(() => {
     const checkDisplays = async () => {
       try {
-        // Check menggunakan Screen API
-        if ((window as any).screen?.getDisplayMedia) {
-          const displays = await (navigator as any).mediaDevices?.enumerateDevices?.();
-          const videoDevices = displays?.filter((d: any) => d.kind === 'videoinput') || [];
-          
-          if (videoDevices.length > 1) {
-            onViolation('MULTIPLE_DISPLAYS', `${videoDevices.length} display terdeteksi`);
-          }
+        if ((navigator as any).mediaDevices?.enumerateDevices) {
+          const devices = await (navigator as any).mediaDevices.enumerateDevices();
+          // enumerateDevices tidak bisa detect monitor eksternal secara reliable,
+          // hanya videoinput (kamera). Skip supaya tidak false positive.
+          // Deteksi ini dipertahankan untuk future API support (getScreenDetails)
         }
-
-        // Check screen resolution changes
-        const screenWidth = window.screen.width;
-        const screenHeight = window.screen.height;
-
-        // Jika ada perubahan drastis, kemungkinan ada monitor tambahan
-        if (screenWidth > 2560 || screenHeight > 1600) {
-          onViolation('MULTIPLE_DISPLAYS', `Resolution tidak standar: ${screenWidth}x${screenHeight}`);
-        }
-      } catch (err) {
-        console.log('Display check error:', err);
+      } catch {
+        // Ignore
       }
     };
 
     checkDisplays();
-    const displayInterval = setInterval(checkDisplays, 10000); // Check setiap 10 detik
-
+    const displayInterval = setInterval(checkDisplays, 10000);
     return () => clearInterval(displayInterval);
   }, [onViolation]);
 
-  // 5. Deteksi aplikasi background
+  // 5. Deteksi tab/window berpindah — dengan grace period
   useEffect(() => {
     const handleVisibilityChange = () => {
+      if (!isReady()) return;
       if (document.hidden) {
         onViolation('TAB_HIDDEN', 'Tab ujian tidak visible');
       }
     };
 
     const handleBlur = () => {
+      if (!isReady()) return;
       onViolation('WINDOW_BLUR', 'Window ujian kehilangan focus');
     };
 
@@ -309,11 +280,11 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
 
   // 6. Deteksi USB/device changes
   useEffect(() => {
-    const handleDeviceChange = (e: Event) => {
+    const handleDeviceChange = () => {
+      if (!isReady()) return;
       onViolation('DEVICE_CHANGE', 'USB atau device baru terdeteksi');
     };
 
-    // Monitor device changes
     if ((navigator as any).mediaDevices?.addEventListener) {
       (navigator as any).mediaDevices.addEventListener('devicechange', handleDeviceChange);
     }
@@ -348,23 +319,14 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
     };
   }, [onViolation]);
 
-  // 8. Monitor network changes (jika internet disconnect)
+  // 8. Monitor network offline
   useEffect(() => {
-    const handleOnline = () => {
-      // Online
-    };
-
     const handleOffline = () => {
       onViolation('NETWORK_OFFLINE', 'Internet connection terputus');
     };
 
-    window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
+    return () => window.removeEventListener('offline', handleOffline);
   }, [onViolation]);
 
   // 9. Prevent zoom
@@ -378,10 +340,7 @@ export function useStrictProctoring(onViolation: ViolationCallback) {
     };
 
     window.addEventListener('wheel', handleWheel, { passive: false });
-
-    return () => {
-      window.removeEventListener('wheel', handleWheel);
-    };
+    return () => window.removeEventListener('wheel', handleWheel);
   }, [onViolation]);
 
   return {

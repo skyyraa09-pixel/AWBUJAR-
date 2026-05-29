@@ -1,35 +1,28 @@
 import { useEffect, useRef } from 'react';
 
-/**
- * useAggressiveFullscreen - Hook untuk aggressive fullscreen enforcement
- *
- * Fitur:
- * - Force fullscreen dan prevent exit
- * - Detect semua cara keluar dari fullscreen
- * - Re-enter fullscreen otomatis jika user keluar
- * - Detect F11 (browser fullscreen)
- * - Detect Alt+Tab, Alt+F4
- * - Continuous fullscreen verification
- * - Block all window resizing
- */
-
 interface ViolationCallback {
   (type: string, description: string): void;
 }
+
+// Grace period setelah masuk fullscreen sebelum mulai enforce (ms)
+const FULLSCREEN_GRACE_MS = 3000;
+// Grace period awal sebelum semua check aktif
+const STARTUP_GRACE_MS = 4000;
 
 export function useAggressiveFullscreen(
   containerRef: React.RefObject<HTMLDivElement | null>,
   onViolation: ViolationCallback
 ) {
   const fullscreenAttemptRef = useRef<number>(0);
-  const lastFullscreenCheckRef = useRef<number>(Date.now());
+  const isReadyToEnforceRef = useRef<boolean>(false);
+  const lastFullscreenEntryRef = useRef<number>(0);
+  const startTimeRef = useRef<number>(Date.now());
 
   useEffect(() => {
     const requestFullscreen = async () => {
       try {
         if (containerRef.current) {
           const elem = containerRef.current as any;
-
           if (elem.requestFullscreen) {
             await elem.requestFullscreen();
           } else if (elem.webkitRequestFullscreen) {
@@ -41,7 +34,7 @@ export function useAggressiveFullscreen(
           }
         }
       } catch {
-        // Fullscreen request mungkin diblok browser — bukan alasan violation
+        // Fullscreen request bisa gagal tanpa user gesture — bukan violation
       }
     };
 
@@ -53,59 +46,74 @@ export function useAggressiveFullscreen(
         (document as any).msFullscreenElement
       );
 
-    // 1. Request fullscreen on load
+    // Cek apakah sudah cukup waktu sejak startup DAN sejak fullscreen terakhir
+    const isGracePeriodOver = () => {
+      const now = Date.now();
+      const sinceStart = now - startTimeRef.current;
+      const sinceFullscreen = now - lastFullscreenEntryRef.current;
+      return (
+        sinceStart > STARTUP_GRACE_MS &&
+        sinceFullscreen > FULLSCREEN_GRACE_MS &&
+        isReadyToEnforceRef.current
+      );
+    };
+
+    // 1. Request fullscreen on load, aktifkan enforce setelah grace period
     const initTimer = setTimeout(requestFullscreen, 500);
+    const readyTimer = setTimeout(() => {
+      isReadyToEnforceRef.current = true;
+    }, STARTUP_GRACE_MS);
 
     // 2. Monitor fullscreen changes
     const handleFullscreenChange = () => {
-      if (!isFullscreenActive()) {
-        fullscreenAttemptRef.current++;
-        onViolation(
-          'FULLSCREEN_EXIT',
-          `Keluar dari fullscreen (${fullscreenAttemptRef.current}x)`
-        );
-
-        // Auto re-enter fullscreen
-        setTimeout(requestFullscreen, 100);
+      if (isFullscreenActive()) {
+        // Baru masuk fullscreen — catat waktu, reset grace period
+        lastFullscreenEntryRef.current = Date.now();
+      } else {
+        // Keluar dari fullscreen — hanya report jika grace period sudah selesai
+        if (isGracePeriodOver()) {
+          fullscreenAttemptRef.current++;
+          onViolation(
+            'FULLSCREEN_EXIT',
+            `Keluar dari fullscreen (${fullscreenAttemptRef.current}x)`
+          );
+        }
+        // Selalu coba re-enter
+        setTimeout(requestFullscreen, 300);
       }
     };
 
-    // 3. Monitor F11 (browser fullscreen) dan shortcut lain
+    // 3. Monitor F11 dan shortcut keluar
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'F11') {
         e.preventDefault();
         e.stopPropagation();
-        onViolation('F11_PRESSED', 'F11 (browser fullscreen) terdeteksi');
+        if (isGracePeriodOver()) {
+          onViolation('F11_PRESSED', 'F11 (browser fullscreen) terdeteksi');
+        }
         return false;
       }
-
-      // Block Alt+F4
       if (e.altKey && e.key === 'F4') {
         e.preventDefault();
         e.stopPropagation();
-        onViolation('ALT_F4', 'Alt+F4 (close window) terdeteksi');
+        if (isGracePeriodOver()) {
+          onViolation('ALT_F4', 'Alt+F4 (close window) terdeteksi');
+        }
         return false;
       }
-
-      // Block Alt+Tab (redundant tapi extra safety)
       if (e.altKey && e.key === 'Tab') {
         e.preventDefault();
         e.stopPropagation();
-        onViolation('ALT_TAB_FULLSCREEN', 'Alt+Tab terdeteksi dalam fullscreen');
+        if (isGracePeriodOver()) {
+          onViolation('ALT_TAB_FULLSCREEN', 'Alt+Tab terdeteksi dalam fullscreen');
+        }
         return false;
       }
     };
 
-    // 4. Monitor window resize
+    // 4. Monitor window resize — hanya setelah grace period
     const handleResize = () => {
-      // Coba maximize window (mungkin diblok browser, tapi boleh dicoba)
-      try {
-        window.moveTo(0, 0);
-        window.resizeTo(window.screen.width, window.screen.height);
-      } catch {
-        // Ignore — diblok browser adalah normal
-      }
-
+      if (!isGracePeriodOver()) return;
       if (
         window.innerWidth < window.screen.width * 0.8 ||
         window.innerHeight < window.screen.height * 0.8
@@ -114,11 +122,17 @@ export function useAggressiveFullscreen(
       }
     };
 
-    // 5. Monitor window position changes
+    // 5. Monitor window position changes — hanya setelah grace period
     let lastWindowX = window.screenX;
     let lastWindowY = window.screenY;
 
     const handleWindowMove = () => {
+      if (!isGracePeriodOver()) {
+        // Update baseline selama grace period supaya tidak false positive
+        lastWindowX = window.screenX;
+        lastWindowY = window.screenY;
+        return;
+      }
       if (window.screenX !== lastWindowX || window.screenY !== lastWindowY) {
         onViolation('WINDOW_MOVED', 'Window position terubah');
         lastWindowX = window.screenX;
@@ -126,38 +140,33 @@ export function useAggressiveFullscreen(
       }
     };
 
-    // 6. Continuous fullscreen verification (setiap 2 detik)
+    // 6. Continuous fullscreen verification — dengan grace period
     const fullscreenCheckInterval = setInterval(() => {
-      const now = Date.now();
-
-      if (now - lastFullscreenCheckRef.current >= 2000) {
-        if (!isFullscreenActive()) {
-          onViolation('FULLSCREEN_CHECK_FAILED', 'Fullscreen verification failed');
-          requestFullscreen();
-        }
-        lastFullscreenCheckRef.current = now;
+      if (!isGracePeriodOver()) return;
+      if (!isFullscreenActive()) {
+        onViolation('FULLSCREEN_CHECK_FAILED', 'Fullscreen verification failed');
+        requestFullscreen();
       }
-    }, 1000);
+    }, 3000); // Check setiap 3 detik (lebih jarang, lebih aman)
 
-    // 7. Monitor for window blur (user switched window)
+    // 7. Window blur — hanya setelah grace period
     const handleBlur = () => {
+      if (!isGracePeriodOver()) return;
       onViolation('WINDOW_BLUR_FULLSCREEN', 'Window blur terdeteksi dalam fullscreen');
-
-      setTimeout(() => {
-        window.focus();
-      }, 100);
+      setTimeout(() => window.focus(), 100);
     };
 
-    // 8. Monitor for visibility changes
+    // 8. Visibility change — hanya setelah grace period
     const handleVisibilityChange = () => {
+      if (!isGracePeriodOver()) return;
       if (document.hidden) {
         onViolation('PAGE_HIDDEN_FULLSCREEN', 'Page hidden dalam fullscreen');
       }
     };
 
-    // 9. Handle Escape key — beberapa browser allow Escape untuk keluar fullscreen
+    // 9. Escape key
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && isGracePeriodOver()) {
         if (!isFullscreenActive()) {
           onViolation('ESCAPE_EXIT_FULLSCREEN', 'Escape key fullscreen exit terdeteksi');
           setTimeout(requestFullscreen, 100);
@@ -165,18 +174,22 @@ export function useAggressiveFullscreen(
       }
     };
 
-    // 10. Prevent context menu dalam fullscreen
+    // 10. Context menu
     const handleContextMenu = (e: MouseEvent) => {
       e.preventDefault();
-      onViolation('CONTEXT_MENU_FULLSCREEN', 'Context menu dalam fullscreen');
+      if (isGracePeriodOver()) {
+        onViolation('CONTEXT_MENU_FULLSCREEN', 'Context menu dalam fullscreen');
+      }
       return false;
     };
 
-    // 11. Monitor Print Screen dalam fullscreen
+    // 11. Print Screen
     const handlePrintScreen = (e: KeyboardEvent) => {
       if (e.key === 'PrintScreen') {
         e.preventDefault();
-        onViolation('PRINT_SCREEN_FULLSCREEN', 'Print screen dalam fullscreen');
+        if (isGracePeriodOver()) {
+          onViolation('PRINT_SCREEN_FULLSCREEN', 'Print screen dalam fullscreen');
+        }
         return false;
       }
     };
@@ -195,11 +208,11 @@ export function useAggressiveFullscreen(
     document.addEventListener('contextmenu', handleContextMenu);
     document.addEventListener('keydown', handlePrintScreen);
 
-    // Periodic window move check
     const moveCheckInterval = setInterval(handleWindowMove, 1000);
 
     return () => {
       clearTimeout(initTimer);
+      clearTimeout(readyTimer);
       clearInterval(fullscreenCheckInterval);
       clearInterval(moveCheckInterval);
 
